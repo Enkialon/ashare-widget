@@ -19,6 +19,8 @@ sealed class CompactWidgetInfo
     public required string WidgetId { get; init; }
     public required string DefinitionId { get; init; }
     public bool IsActive { get; set; }
+    public object UpdateGate { get; } = new();
+    public string? LastTemplate { get; set; }
 }
 
 [ComVisible(true)]
@@ -28,18 +30,18 @@ sealed class QuoteWidgetProvider : IWidgetProvider
     static readonly ConcurrentDictionary<string, CompactWidgetInfo> RunningWidgets = new();
     // The message loop waits on this native event alongside Windows messages.
     static readonly ManualResetEvent EmptyWidgetListEvent = new(false);
-    static readonly object RefreshGate = new();
     static readonly object LifecycleGate = new();
+    static readonly object ContentGate = new();
     static readonly HashSet<string> DeletedWidgets = new();
     static StockConfig _config = new();
     static readonly Lazy<IQuoteSource> Source = new(CreateSource);
 
-    static Timer? _refreshTimer;
+    static readonly RefreshScheduler Refresh = new(
+        () => TimeSpan.FromSeconds(Config.RefreshSeconds), RefreshAndPushAsync);
     static IReadOnlyList<Quote> _lastQuotes = [];
     static string _statusLine = "加载中…";
     static string _lastError = "";
     static DateTimeOffset? _lastOk;
-    static int _refreshBusy;
     /// <summary>Bumps to cancel a pending process-exit after the last widget is removed.</summary>
     static int _exitGeneration;
 
@@ -87,7 +89,7 @@ sealed class QuoteWidgetProvider : IWidgetProvider
                     {
                         WidgetId = id,
                         DefinitionId = definition,
-                        IsActive = true,
+                        IsActive = false,
                     });
                     Interlocked.Increment(ref _exitGeneration);
                     EmptyWidgetListEvent.Reset();
@@ -95,16 +97,8 @@ sealed class QuoteWidgetProvider : IWidgetProvider
             }
 
             ProviderLog.Info($"restored widgets={RunningWidgets.Count}");
-            if (!RunningWidgets.IsEmpty)
-            {
-                EnsureRefreshTimer();
-                foreach (var w in RunningWidgets.Values)
-                {
-                    UpdateWidget(w);
-                }
-
-                _ = RefreshAndPushAsync();
-            }
+            // Existing cards already belong to Windows. Restore identity only;
+            // do not replace their content with a loading card on process restart.
         }
         catch (Exception ex)
         {
@@ -128,9 +122,10 @@ sealed class QuoteWidgetProvider : IWidgetProvider
             Interlocked.Increment(ref _exitGeneration);
             EmptyWidgetListEvent.Reset();
             DeletedWidgets.Remove(info.WidgetId);
-            RunningWidgets[info.WidgetId] = info;
+            info = RunningWidgets.GetOrAdd(info.WidgetId, info);
+            info.IsActive = true;
         }
-        QueueUpdate(info);
+        QueueRefresh(info, initialCreation: true);
     }
 
     public void DeleteWidget(string widgetId, string customState)
@@ -142,12 +137,12 @@ sealed class QuoteWidgetProvider : IWidgetProvider
         {
             DeletedWidgets.Add(widgetId);
             RunningWidgets.TryRemove(widgetId, out _);
+            Refresh.SetActive(RunningWidgets.Values.Any(w => w.IsActive));
             if (!RunningWidgets.IsEmpty)
                 return;
             gen = Interlocked.Increment(ref _exitGeneration);
         }
 
-        StopRefreshTimer();
         // Allow the host to delete/recreate during pinning without a cold start.
         _ = Task.Run(async () =>
         {
@@ -175,11 +170,9 @@ sealed class QuoteWidgetProvider : IWidgetProvider
 
     public void OnWidgetContextChanged(WidgetContextChangedArgs contextChangedArgs)
     {
-        var id = contextChangedArgs.WidgetContext.Id;
-        if (RunningWidgets.TryGetValue(id, out var info))
-        {
-            QueueUpdate(info);
-        }
+        // The same card supports every declared size. A resize or monitor change
+        // does not invalidate its content and does not require an update.
+        _ = contextChangedArgs;
     }
 
     public void Activate(WidgetContext widgetContext)
@@ -203,10 +196,10 @@ sealed class QuoteWidgetProvider : IWidgetProvider
             });
             info.IsActive = true;
         }
-        QueueUpdate(info);
+        QueueRefresh(info);
     }
 
-    static void QueueUpdate(CompactWidgetInfo info)
+    static void QueueRefresh(CompactWidgetInfo info, bool initialCreation = false)
     {
         _ = Task.Run(async () =>
         {
@@ -214,10 +207,14 @@ sealed class QuoteWidgetProvider : IWidgetProvider
             {
                 if (!RunningWidgets.TryGetValue(info.WidgetId, out var current) || !ReferenceEquals(current, info))
                     return;
-                UpdateWidget(info);
-                if (info.IsActive)
-                    EnsureRefreshTimer();
-                await RefreshAndPushAsync().ConfigureAwait(false);
+                // Only a newly added card needs an initial submission. On Activate
+                // Windows keeps the previously submitted card, including while HTTP runs.
+                if (initialCreation)
+                    UpdateWidget(info);
+                _config = StockConfig.Load();
+                lock (LifecycleGate)
+                    Refresh.SetActive(RunningWidgets.Values.Any(w => w.IsActive));
+                await Refresh.RequestAsync(initialCreation).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -228,86 +225,49 @@ sealed class QuoteWidgetProvider : IWidgetProvider
 
     public void Deactivate(string widgetId)
     {
-        if (RunningWidgets.TryGetValue(widgetId, out var info))
+        lock (LifecycleGate)
         {
-            info.IsActive = false;
-        }
-
-        if (RunningWidgets.Values.All(w => !w.IsActive))
-        {
-            StopRefreshTimer();
-        }
-    }
-
-    static void EnsureRefreshTimer()
-    {
-        lock (RefreshGate)
-        {
-            if (_refreshTimer is not null || !RunningWidgets.Values.Any(w => w.IsActive))
-            {
-                return;
-            }
-
-            _config = StockConfig.Load();
-            var period = TimeSpan.FromSeconds(Config.RefreshSeconds);
-            _refreshTimer = new Timer(
-                _ => _ = RefreshAndPushAsync(),
-                null,
-                TimeSpan.FromSeconds(1),
-                period);
-            ProviderLog.Info($"timer start period={Config.RefreshSeconds}s");
-        }
-    }
-
-    static void StopRefreshTimer()
-    {
-        lock (RefreshGate)
-        {
-            _refreshTimer?.Dispose();
-            _refreshTimer = null;
-            ProviderLog.Info("timer stop");
+            if (RunningWidgets.TryGetValue(widgetId, out var info))
+                info.IsActive = false;
+            Refresh.SetActive(RunningWidgets.Values.Any(w => w.IsActive));
         }
     }
 
     static async Task RefreshAndPushAsync()
     {
-        if (Interlocked.Exchange(ref _refreshBusy, 1) == 1)
-        {
-            return;
-        }
-
         try
         {
             // Reload AppData stocks.json each tick so manual edits apply without reinstall.
             _config = StockConfig.Load();
             var codes = _config.ResolveTencentCodes();
             var quotes = await Source.Value.FetchAsync(codes).ConfigureAwait(false);
-            if (quotes.Count > 0)
+            lock (ContentGate)
             {
-                _lastQuotes = quotes;
-                _lastError = "";
-                _lastOk = DateTimeOffset.Now;
-                _statusLine = _lastOk.Value.ToLocalTime().ToString("HH:mm:ss");
-                ProviderLog.Info($"fetch ok count={quotes.Count}");
-            }
-            else
-            {
-                _lastError = "未拿到行情（检查代码或网络）";
-                _statusLine = _lastError;
-                ProviderLog.Error("fetch empty");
+                if (quotes.Count > 0)
+                {
+                    _lastQuotes = quotes;
+                    _lastError = "";
+                    _lastOk = DateTimeOffset.Now;
+                    _statusLine = _lastOk.Value.ToLocalTime().ToString("HH:mm:ss");
+                    ProviderLog.Info($"fetch ok count={quotes.Count}");
+                }
+                else
+                {
+                    _lastError = "未拿到行情（检查代码或网络）";
+                    _statusLine = _lastError;
+                    ProviderLog.Error("fetch empty");
+                }
             }
         }
         catch (Exception ex)
         {
-            _lastError = "刷新失败: " + Truncate(ex.Message, 80);
-            _statusLine = _lastError;
+            lock (ContentGate)
+            {
+                _lastError = "刷新失败: " + Truncate(ex.Message, 80);
+                _statusLine = _lastError;
+            }
             ProviderLog.Error("fetch", ex);
         }
-        finally
-        {
-            Interlocked.Exchange(ref _refreshBusy, 0);
-        }
-
         foreach (var info in RunningWidgets.Values.ToArray())
         {
             UpdateWidget(info);
@@ -327,15 +287,25 @@ sealed class QuoteWidgetProvider : IWidgetProvider
 
         try
         {
-            // Pre-expand Adaptive Card in-process. Host-side ${} templating + dynamic
-            // color bindings have been observed to render a blank Widgets Board card.
-            var options = new WidgetUpdateRequestOptions(info.WidgetId)
+            lock (info.UpdateGate)
             {
-                Template = BuildCardJson(),
-                Data = "{}",
-                CustomState = string.Empty,
-            };
-            WidgetManager.GetDefault().UpdateWidget(options);
+                string template;
+                lock (ContentGate)
+                    template = BuildCardJson();
+                if (template == info.LastTemplate)
+                    return;
+                // Pre-expand Adaptive Card in-process. Host-side ${} templating + dynamic
+                // color bindings have been observed to render a blank Widgets Board card.
+                var options = new WidgetUpdateRequestOptions(info.WidgetId)
+                {
+                    Template = template,
+                    Data = "{}",
+                    CustomState = string.Empty,
+                };
+                WidgetManager.GetDefault().UpdateWidget(options);
+                info.LastTemplate = template;
+                ProviderLog.Info($"UpdateWidget id={info.WidgetId}");
+            }
         }
         catch (Exception ex)
         {

@@ -15,5 +15,6 @@
   <ItemGroup>
     <ProjectReference Include="../../src/AShareWidget.Provider/AShareWidget.Provider.csproj" />
     <Compile Include="../../src/AShareWidget.Provider/Com/FactoryHelper.cs" Link="FactoryHelper.cs" />
+    <Compile Include="../../src/AShareWidget.Provider/RefreshScheduler.cs" Link="RefreshScheduler.cs" />
   </ItemGroup>
 </Project>
