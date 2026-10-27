@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <WindowsAppSdkBootstrapInitialize>false</WindowsAppSdkBootstrapInitialize>
+    <WindowsPackageType>None</WindowsPackageType>
+    <EnableMsixTooling>false</EnableMsixTooling>
+    <EnableCoreMrtTooling>false</EnableCoreMrtTooling>
+    <AppxPackage>false</AppxPackage>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/AShareWidget.Provider/AShareWidget.Provider.csproj" />
+    <Compile Include="../../src/AShareWidget.Provider/Com/FactoryHelper.cs" Link="FactoryHelper.cs" />
+  </ItemGroup>
+</Project>

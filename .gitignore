@@ -1,0 +1,41 @@
+# .NET build and test output
+bin/
+obj/
+TestResults/
+
+# Published binaries and packaging output
+/publish/
+/sideload-staging/
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+*.appinstaller
+
+# Local signing certificates and private keys
+/.certs/
+*.pfx
+*.p12
+*.cer
+*.key
+
+# Editor and per-user settings
+.vs/
+.vscode/
+.idea/
+.cursor/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Local environment and temporary files
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.bak
+Thumbs.db
+Desktop.ini
+.DS_Store
