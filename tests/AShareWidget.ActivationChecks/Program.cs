@@ -48,6 +48,7 @@ finally { stop.Set(); thread.Join(3000); }
 ClassObject.WaitWithComDispatch(stop);
 Console.WriteLine("PASS: signaled shutdown event exits immediately");
 await RefreshChecks.RunAsync();
+PagingChecks.Run();
 
 static void Check(bool condition, string name)
 {

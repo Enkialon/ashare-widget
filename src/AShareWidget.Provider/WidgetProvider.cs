@@ -1,8 +1,6 @@
 using System.Collections.Concurrent;
-using System.Globalization;
 using System.Runtime.InteropServices;
-using System.Text;
-using System.Text.Json;
+using Microsoft.Windows.Widgets;
 using Microsoft.Windows.Widgets.Providers;
 using AShareWidget.Quotes;
 
@@ -21,6 +19,7 @@ sealed class CompactWidgetInfo
     public bool IsActive { get; set; }
     public object UpdateGate { get; } = new();
     public string? LastTemplate { get; set; }
+    public WidgetPageState Page { get; } = new();
 }
 
 [ComVisible(true)]
@@ -80,17 +79,32 @@ sealed class QuoteWidgetProvider : IWidgetProvider
                 var ctx = info.WidgetContext;
                 var id = ctx.Id;
                 var definition = ctx.DefinitionId;
+                var rows = RowsPerPage(ctx.Size);
+                var state = info.CustomState;
                 lock (LifecycleGate)
                 {
                     // A Delete callback can arrive while GetWidgetInfos is in flight.
                     if (DeletedWidgets.Contains(id))
                         continue;
-                    RunningWidgets.TryAdd(id, new CompactWidgetInfo
+                    var restored = RunningWidgets.GetOrAdd(id, new CompactWidgetInfo
                     {
                         WidgetId = id,
                         DefinitionId = definition,
                         IsActive = false,
                     });
+                    lock (restored.UpdateGate)
+                    {
+                        var previousPage = restored.Page.Index;
+                        bool hasQuotes;
+                        lock (ContentGate)
+                        {
+                            hasQuotes = _lastQuotes.Count > 0;
+                            restored.Page.Resize(rows, _lastQuotes.Count);
+                        }
+                        restored.Page.Restore(state);
+                        if (hasQuotes && restored.Page.Index != previousPage)
+                            _ = Task.Run(() => UpdateWidget(restored));
+                    }
                     Interlocked.Increment(ref _exitGeneration);
                     EmptyWidgetListEvent.Reset();
                 }
@@ -117,6 +131,7 @@ sealed class QuoteWidgetProvider : IWidgetProvider
             DefinitionId = widgetContext.DefinitionId,
             IsActive = true,
         };
+        info.Page.Resize(RowsPerPage(widgetContext.Size), 0);
         lock (LifecycleGate)
         {
             Interlocked.Increment(ref _exitGeneration);
@@ -165,14 +180,57 @@ sealed class QuoteWidgetProvider : IWidgetProvider
         });
     }
 
-    public void OnActionInvoked(WidgetActionInvokedArgs actionInvokedArgs) =>
-        _ = actionInvokedArgs;
+    public void OnActionInvoked(WidgetActionInvokedArgs actionInvokedArgs)
+    {
+        var delta = actionInvokedArgs.Verb switch
+        {
+            "page.previous" => -1,
+            "page.next" => 1,
+            _ => 0,
+        };
+        if (delta == 0) return;
+        var id = actionInvokedArgs.WidgetContext.Id;
+        if (!RunningWidgets.TryGetValue(id, out var info)) return;
+        lock (info.UpdateGate)
+        {
+            lock (ContentGate)
+            {
+                // After a process restart, leave the cached page intact until
+                // activation has reloaded quotes. Paging itself never fetches.
+                if (_lastQuotes.Count == 0 || !info.Page.Move(delta, _lastQuotes.Count)) return;
+            }
+        }
+        _ = Task.Run(() => UpdateWidget(info));
+    }
 
     public void OnWidgetContextChanged(WidgetContextChangedArgs contextChangedArgs)
     {
-        // The same card supports every declared size. A resize or monitor change
-        // does not invalidate its content and does not require an update.
-        _ = contextChangedArgs;
+        var context = contextChangedArgs.WidgetContext;
+        if (RunningWidgets.TryGetValue(context.Id, out var info))
+            ResizePage(info, RowsPerPage(context.Size));
+    }
+
+    static int RowsPerPage(WidgetSize size) => size switch
+    {
+        WidgetSize.Small => 2,
+        WidgetSize.Large => 9,
+        _ => 5,
+    };
+
+    static void ResizePage(CompactWidgetInfo info, int rows)
+    {
+        bool changed;
+        bool hasQuotes;
+        lock (info.UpdateGate)
+        {
+            lock (ContentGate)
+            {
+                hasQuotes = _lastQuotes.Count > 0;
+                changed = info.Page.Resize(rows, _lastQuotes.Count);
+            }
+        }
+        if (changed && hasQuotes)
+            _ = Task.Run(() => UpdateWidget(info));
     }
 
     public void Activate(WidgetContext widgetContext)
@@ -196,6 +254,7 @@ sealed class QuoteWidgetProvider : IWidgetProvider
             });
             info.IsActive = true;
         }
+        ResizePage(info, RowsPerPage(widgetContext.Size));
         QueueRefresh(info);
     }
 
@@ -291,7 +350,7 @@ sealed class QuoteWidgetProvider : IWidgetProvider
             {
                 string template;
                 lock (ContentGate)
-                    template = BuildCardJson();
+                    template = WidgetCard.Build(_lastQuotes, _statusLine, _lastError, info.Page);
                 if (template == info.LastTemplate)
                     return;
                 // Pre-expand Adaptive Card in-process. Host-side ${} templating + dynamic
@@ -300,7 +359,7 @@ sealed class QuoteWidgetProvider : IWidgetProvider
                 {
                     Template = template,
                     Data = "{}",
-                    CustomState = string.Empty,
+                    CustomState = info.Page.Save(),
                 };
                 WidgetManager.GetDefault().UpdateWidget(options);
                 info.LastTemplate = template;
@@ -313,103 +372,6 @@ sealed class QuoteWidgetProvider : IWidgetProvider
         }
     }
 
-    /// <summary>
-    /// Fully materialised Adaptive Card 1.3 JSON (no Adaptive Templating placeholders).
-    /// </summary>
-    static string BuildCardJson()
-    {
-        var inv = CultureInfo.InvariantCulture;
-        var sb = new StringBuilder(1024);
-        sb.Append("""
-            {"type":"AdaptiveCard","version":"1.3","$schema":"http://adaptivecards.io/schemas/adaptive-card.json","body":[
-            """);
-
-        var first = true;
-        void AppendComma()
-        {
-            if (!first)
-            {
-                sb.Append(',');
-            }
-
-            first = false;
-        }
-
-        if (_lastQuotes.Count == 0)
-        {
-            AppendComma();
-            sb.Append("{\"type\":\"TextBlock\",\"text\":");
-            AppendJsonString(sb, string.IsNullOrEmpty(_lastError) ? "等待行情…" : _lastError);
-            sb.Append(",\"wrap\":true}");
-        }
-        else
-        {
-            foreach (var q in _lastQuotes)
-            {
-                var up = q.ChangePct > 0;
-                var flat = Math.Abs(q.ChangePct) < 0.000_000_1;
-                var sign = up ? "+" : "";
-                var changeLine = flat
-                    ? "0.00  0.00%"
-                    : $"{sign}{q.Change.ToString("0.00", inv)}  {sign}{q.ChangePct.ToString("0.00", inv)}%";
-                // Attention≈红 / Good≈绿 — A-share convention, set as literals (not ${}).
-                var color = flat ? "Default" : up ? "Attention" : "Good";
-                var code = StripPrefix(q.Code);
-                var price = q.Price.ToString("0.00", inv);
-
-                AppendComma();
-                sb.Append("{\"type\":\"ColumnSet\",\"spacing\":\"Small\",\"columns\":[");
-                sb.Append("{\"type\":\"Column\",\"width\":\"stretch\",\"items\":[");
-                sb.Append("{\"type\":\"TextBlock\",\"weight\":\"Bolder\",\"wrap\":true,\"text\":");
-                AppendJsonString(sb, q.Name);
-                sb.Append("},{\"type\":\"TextBlock\",\"isSubtle\":true,\"size\":\"Small\",\"spacing\":\"None\",\"text\":");
-                AppendJsonString(sb, code);
-                sb.Append("}]},");
-                sb.Append("{\"type\":\"Column\",\"width\":\"auto\",\"verticalContentAlignment\":\"Center\",\"items\":[");
-                sb.Append("{\"type\":\"TextBlock\",\"horizontalAlignment\":\"Right\",\"weight\":\"Bolder\",\"text\":");
-                AppendJsonString(sb, price);
-                sb.Append("},{\"type\":\"TextBlock\",\"horizontalAlignment\":\"Right\",\"spacing\":\"None\",\"size\":\"Small\",\"color\":\"");
-                sb.Append(color);
-                sb.Append("\",\"text\":");
-                AppendJsonString(sb, changeLine);
-                sb.Append("}]}]}");
-            }
-        }
-
-        // Bottom-right time (avoid height:stretch — can blank the Widgets Board card).
-        AppendComma();
-        sb.Append("{\"type\":\"TextBlock\",\"text\":");
-        AppendJsonString(sb, _statusLine);
-        sb.Append(",\"isSubtle\":true,\"spacing\":\"Small\",\"size\":\"Small\",\"horizontalAlignment\":\"Right\",\"wrap\":true}");
-
-        sb.Append("]}");
-        return sb.ToString();
-    }
-
-    static void AppendJsonString(StringBuilder sb, string value)
-    {
-        sb.Append(JsonSerializer.Serialize(value));
-    }
-
-    static string StripPrefix(string code)
-    {
-        if (code.StartsWith("us.", StringComparison.OrdinalIgnoreCase))
-        {
-            return code[3..];
-        }
-
-        foreach (var prefix in new[] { "sh", "sz", "bj", "hk", "us" })
-        {
-            if (code.Length > prefix.Length
-                && code.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-            {
-                var rest = code[prefix.Length..];
-                return rest.StartsWith('.') ? rest[1..] : rest;
-            }
-        }
-
-        return code;
-    }
 
     static string Truncate(string s, int max) =>
         s.Length <= max ? s : s[..max] + "…";
