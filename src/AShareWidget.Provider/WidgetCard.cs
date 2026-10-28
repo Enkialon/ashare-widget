@@ -44,9 +44,12 @@ static class WidgetCard
                 var up = q.ChangePct > 0;
                 var flat = Math.Abs(q.ChangePct) < 0.000_000_1;
                 var sign = up ? "+" : "";
+                // An em space keeps a visible gap; ordinary consecutive spaces
+                // can collapse when TextBlock content is rendered as Markdown.
+                const string changeGap = "\u2003";
                 var changeLine = flat
-                    ? "0.00  0.00%"
-                    : $"{sign}{q.Change.ToString("0.00", inv)}  {sign}{q.ChangePct.ToString("0.00", inv)}%";
+                    ? $"0.00{changeGap}0.00%"
+                    : $"{sign}{q.Change.ToString("0.00", inv)}{changeGap}{sign}{q.ChangePct.ToString("0.00", inv)}%";
                 // Attention≈红 / Good≈绿 — A-share convention, set as literals (not ${}).
                 var color = flat ? "Default" : up ? "Attention" : "Good";
                 var code = StripPrefix(q.Code);

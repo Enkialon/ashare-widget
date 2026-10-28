@@ -12,7 +12,7 @@ static class PagingChecks
             Change = i % 2 == 0 ? -1 : 1, ChangePct = i % 2 == 0 ? -1 : 1,
         }).ToArray();
 
-        foreach (int capacity in new[] { 2, 5, 9 })
+        foreach (int capacity in new[] { 1, 5, 9 })
         {
             var page = new WidgetPageState();
             page.Resize(capacity, quotes.Length);
@@ -63,7 +63,7 @@ static class PagingChecks
         }
         var delayed = new WidgetPageState();
         delayed.Restore("{\"page\":2}");
-        delayed.Resize(2, 0);
+        delayed.Resize(1, 0);
         Check(delayed.Start == 10, "cold-start resize retains anchor before quotes arrive");
         var clicked = new WidgetPageState();
         clicked.Move(1, quotes.Length);

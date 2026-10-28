@@ -212,7 +212,7 @@ sealed class QuoteWidgetProvider : IWidgetProvider
 
     static int RowsPerPage(WidgetSize size) => size switch
     {
-        WidgetSize.Small => 2,
+        WidgetSize.Small => 1,
         WidgetSize.Large => 9,
         _ => 5,
     };
