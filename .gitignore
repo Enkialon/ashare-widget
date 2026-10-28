@@ -5,6 +5,7 @@ TestResults/
 
 # Published binaries and packaging output
 /publish/
+/dist/
 /sideload-staging/
 *.msix
 *.msixbundle
