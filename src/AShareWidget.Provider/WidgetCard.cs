@@ -42,18 +42,19 @@ static class WidgetCard
             foreach (var q in quotes.Skip(page.Start).Take(page.PageSize))
             {
                 var up = q.ChangePct > 0;
-                var flat = Math.Abs(q.ChangePct) < 0.000_000_1;
-                var sign = up ? "+" : "";
+                var flat = !q.ChangePct.HasValue || Math.Abs(q.ChangePct.Value) < 0.000_000_1;
                 // An em space keeps a visible gap; ordinary consecutive spaces
                 // can collapse when TextBlock content is rendered as Markdown.
                 const string changeGap = "\u2003";
-                var changeLine = flat
-                    ? $"0.00{changeGap}0.00%"
-                    : $"{sign}{q.Change.ToString("0.00", inv)}{changeGap}{sign}{q.ChangePct.ToString("0.00", inv)}%";
+                string Signed(double? value) => value.HasValue
+                    ? (value.Value > 0 ? "+" : "") + value.Value.ToString("0.00", inv) : "--";
+                var changeLine = $"{Signed(q.Change)}{changeGap}{Signed(q.ChangePct)}{(q.ChangePct.HasValue ? "%" : "")}";
                 // Attention≈红 / Good≈绿 — A-share convention, set as literals (not ${}).
                 var color = flat ? "Default" : up ? "Attention" : "Good";
-                var code = StripPrefix(q.Code);
-                var price = q.Price.ToString("0.00", inv);
+                var code = q.Code;
+                if (q.Error is not null)
+                    code = q.IsAvailable ? $"缓存 · {code}" : q.Error;
+                var price = q.Price?.ToString("0.00##", inv) ?? "--";
 
                 AppendComma();
                 sb.Append("{\"type\":\"ColumnSet\",\"spacing\":\"Small\",\"columns\":[");
@@ -110,26 +111,6 @@ static class WidgetCard
     static void AppendJsonString(StringBuilder sb, string value)
     {
         sb.Append(JsonSerializer.Serialize(value));
-    }
-
-    static string StripPrefix(string code)
-    {
-        if (code.StartsWith("us.", StringComparison.OrdinalIgnoreCase))
-        {
-            return code[3..];
-        }
-
-        foreach (var prefix in new[] { "sh", "sz", "bj", "hk", "us" })
-        {
-            if (code.Length > prefix.Length
-                && code.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-            {
-                var rest = code[prefix.Length..];
-                return rest.StartsWith('.') ? rest[1..] : rest;
-            }
-        }
-
-        return code;
     }
 
     static object Arrow(string label, string verb, bool enabled)

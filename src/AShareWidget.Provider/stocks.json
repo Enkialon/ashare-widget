@@ -1,11 +1,10 @@
 {
-  "source": "tencent",
   "refreshSeconds": 15,
   "codes": [
-    "sh.588080",
-    "sh.588760",
-    "sh.600438",
-    "sz.159632",
-    "us.NDX"
+    "tencent:sh588080",
+    "tencent:sh588760",
+    "tencent:sh600438",
+    "tencent:sz159632",
+    "tencent:usNDX"
   ]
 }

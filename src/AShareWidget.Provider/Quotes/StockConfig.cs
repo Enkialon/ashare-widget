@@ -3,236 +3,52 @@ using System.Text.Json.Serialization;
 
 namespace AShareWidget.Quotes;
 
-/// <summary>
-/// User-editable quote list. One ordered <c>codes</c> array; each code uses
-/// Tencent style <c>market.symbol</c> (sh/sz/bj/hk/us), e.g. us.NDX, sh.600519.
-/// </summary>
 public sealed class StockConfig
 {
-    static readonly JsonSerializerOptions WriteOptions = new()
-    {
-        WriteIndented = true,
-    };
-
-    [JsonPropertyName("source")]
-    public string Source { get; set; } = QuoteSourceFactory.DefaultName;
-
     [JsonPropertyName("refreshSeconds")]
     public int RefreshSeconds { get; set; } = 15;
-
-    /// <summary>Display / fetch order. Prefer <c>sh.600519</c> / <c>us.NDX</c>.</summary>
     [JsonPropertyName("codes")]
     public List<string> Codes { get; set; } = [];
-
-    /// <summary>
-    /// Real path (not MSIX sandbox):
-    /// C:\Users\…\AppData\Local\AShareWidget\stocks.json
-    /// </summary>
-    public static string UserConfigPath =>
-        Path.Combine(AppPaths.UserDataDirectory, "stocks.json");
-
+    public static string UserConfigPath => Path.Combine(AppPaths.UserDataDirectory, "stocks.json");
     public static string UserDataDirectory => AppPaths.UserDataDirectory;
-
-    static string PackagedConfigPath =>
-        Path.Combine(AppContext.BaseDirectory, "stocks.json");
-
-    static IEnumerable<string> LegacyConfigCandidates()
-    {
-        var profileLocal = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            "AppData", "Local");
-        // Previous Chinese folder name
-        yield return Path.Combine(profileLocal, "股票行情", "stocks.json");
-        // MSIX-redirected LocalApplicationData
-        yield return Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AShareWidget",
-            "stocks.json");
-        yield return PackagedConfigPath;
-    }
-
-    /// <summary>Map config codes to qt.gtimg.cn query ids, preserving order.</summary>
-    public IReadOnlyList<string> ResolveTencentCodes()
-    {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var list = new List<string>();
-        foreach (var raw in Codes)
-        {
-            var q = TencentQuoteSource.ToQueryId(raw);
-            if (q.Length == 0 || !seen.Add(q))
-            {
-                continue;
-            }
-
-            list.Add(q);
-            if (list.Count >= 12)
-            {
-                break;
-            }
-        }
-
-        return list;
-    }
-
     public static StockConfig Load()
     {
-        try
-        {
-            EnsureUserConfig();
-            return ParseFile(UserConfigPath) ?? CreateDefault();
-        }
-        catch
-        {
-            return CreateDefault();
-        }
+        EnsureUserConfig();
+        // Do not silently turn malformed or obsolete input into a different list.
+        return Parse(File.ReadAllText(UserConfigPath));
     }
-
     public static void EnsureUserConfig()
     {
-        if (File.Exists(UserConfigPath))
-        {
-            return;
-        }
-
-        foreach (var candidate in LegacyConfigCandidates())
-        {
-            try
-            {
-                if (!File.Exists(candidate))
-                {
-                    continue;
-                }
-
-                var migrated = ParseFile(candidate) ?? CreateDefault();
-                WriteUserConfig(migrated);
-                return;
-            }
-            catch
-            {
-                // try next
-            }
-        }
-
-        WriteUserConfig(CreateDefault());
+        if (File.Exists(UserConfigPath)) return;
+        var config = Parse(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "stocks.json")));
+        File.WriteAllText(UserConfigPath, JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }));
     }
-
-    static void WriteUserConfig(StockConfig cfg)
+    public static StockConfig Parse(string json)
     {
-        var wire = new StockConfig
-        {
-            Source = string.IsNullOrWhiteSpace(cfg.Source)
-                ? QuoteSourceFactory.DefaultName
-                : cfg.Source,
-            RefreshSeconds = Math.Clamp(cfg.RefreshSeconds, 5, 300),
-            Codes = cfg.Codes
-                .Select(TencentQuoteSource.ToCanonical)
-                .Where(c => c.Length > 0)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Take(12)
-                .ToList(),
-        };
-
-        if (wire.Codes.Count == 0)
-        {
-            wire = CreateDefault();
-        }
-
-        File.WriteAllText(
-            UserConfigPath,
-            JsonSerializer.Serialize(wire, WriteOptions) + Environment.NewLine);
-    }
-
-    static StockConfig? ParseFile(string path)
-    {
-        if (!File.Exists(path))
-        {
-            return null;
-        }
-
-        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
-        if (root.ValueKind != JsonValueKind.Object)
+        if (root.ValueKind != JsonValueKind.Object) throw new FormatException("配置必须为 JSON 对象。");
+        foreach (var property in root.EnumerateObject())
+            if (property.Name is not ("refreshSeconds" or "codes"))
+                throw new FormatException($"不支持配置字段“{property.Name}”。请使用 数据源:原生代码，删除旧 source 字段。");
+        var config = new StockConfig();
+        if (root.TryGetProperty("refreshSeconds", out var refresh))
         {
-            return null;
+            if (refresh.ValueKind != JsonValueKind.Number || !refresh.TryGetInt32(out var seconds) || seconds is < 5 or > 300)
+                throw new FormatException("refreshSeconds 必须是 5 到 300 之间的整数。");
+            config.RefreshSeconds = seconds;
         }
-
-        var cfg = new StockConfig();
-        if (root.TryGetProperty("source", out var src) && src.ValueKind == JsonValueKind.String)
+        if (!root.TryGetProperty("codes", out var codes) || codes.ValueKind != JsonValueKind.Array)
+            throw new FormatException("配置需要 codes 数组。");
+        if (codes.GetArrayLength() > 12) throw new FormatException("目前最多支持 12 个关注项。");
+        foreach (var code in codes.EnumerateArray())
         {
-            cfg.Source = src.GetString() ?? QuoteSourceFactory.DefaultName;
+            if (code.ValueKind != JsonValueKind.String) throw new FormatException("codes 中的每一项必须为字符串。");
+            var value = code.GetString()!;
+            var request = QuoteRequest.Parse(value);
+            if (request.Source is not ("tencent" or "sina")) throw new FormatException($"未知数据源“{request.Source}”。");
+            config.Codes.Add(value);
         }
-
-        if (root.TryGetProperty("refreshSeconds", out var rs) && rs.TryGetInt32(out var seconds))
-        {
-            cfg.RefreshSeconds = Math.Clamp(seconds, 5, 300);
-        }
-
-        // Preferred: single ordered codes[].
-        if (root.TryGetProperty("codes", out var codesEl) && codesEl.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in codesEl.EnumerateArray())
-            {
-                if (item.ValueKind == JsonValueKind.String)
-                {
-                    var c = TencentQuoteSource.ToCanonical(item.GetString() ?? "");
-                    if (c.Length > 0)
-                    {
-                        cfg.Codes.Add(c);
-                    }
-                }
-            }
-        }
-
-        // Legacy market-split files → flatten (order: sh, sz, bj, hk, us).
-        if (cfg.Codes.Count == 0)
-        {
-            foreach (var market in new[] { "sh", "sz", "bj", "hk", "us" })
-            {
-                if (!root.TryGetProperty(market, out var arr) || arr.ValueKind != JsonValueKind.Array)
-                {
-                    continue;
-                }
-
-                foreach (var item in arr.EnumerateArray())
-                {
-                    if (item.ValueKind != JsonValueKind.String)
-                    {
-                        continue;
-                    }
-
-                    var c = TencentQuoteSource.ToCanonical(market + "." + (item.GetString() ?? ""));
-                    if (c.Length > 0)
-                    {
-                        cfg.Codes.Add(c);
-                    }
-                }
-            }
-        }
-
-        cfg.Codes = cfg.Codes
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Take(12)
-            .ToList();
-
-        if (string.IsNullOrWhiteSpace(cfg.Source))
-        {
-            cfg.Source = QuoteSourceFactory.DefaultName;
-        }
-
-        return cfg.Codes.Count == 0 ? null : cfg;
+        return config;
     }
-
-    static StockConfig CreateDefault() => new()
-    {
-        Source = QuoteSourceFactory.DefaultName,
-        RefreshSeconds = 15,
-        Codes =
-        [
-            "sh.588080",
-            "sh.588760",
-            "sh.600438",
-            "sz.159632",
-            "us.NDX",
-        ],
-    };
 }

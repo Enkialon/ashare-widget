@@ -33,7 +33,7 @@ sealed class QuoteWidgetProvider : IWidgetProvider
     static readonly object ContentGate = new();
     static readonly HashSet<string> DeletedWidgets = new();
     static StockConfig _config = new();
-    static readonly Lazy<IQuoteSource> Source = new(CreateSource);
+    static readonly IQuoteService Source = new QuoteService();
 
     static readonly RefreshScheduler Refresh = new(
         () => TimeSpan.FromSeconds(Config.RefreshSeconds), RefreshAndPushAsync);
@@ -45,23 +45,6 @@ sealed class QuoteWidgetProvider : IWidgetProvider
     static int _exitGeneration;
 
     static StockConfig Config => _config;
-
-    static IQuoteSource CreateSource()
-    {
-        try
-        {
-            var src = QuoteSourceFactory.Create(_config.Source);
-            var codes = _config.ResolveTencentCodes();
-            ProviderLog.Info(
-                $"quote source={src.Name} ({src.DisplayName}), codes={string.Join(',', codes)}, config={StockConfig.UserConfigPath}");
-            return src;
-        }
-        catch (Exception ex)
-        {
-            ProviderLog.Error("CreateSource failed, fallback tencent", ex);
-            return QuoteSourceFactory.Create(QuoteSourceFactory.DefaultName);
-        }
-    }
 
     public QuoteWidgetProvider()
     {
@@ -270,7 +253,6 @@ sealed class QuoteWidgetProvider : IWidgetProvider
                 // Windows keeps the previously submitted card, including while HTTP runs.
                 if (initialCreation)
                     UpdateWidget(info);
-                _config = StockConfig.Load();
                 lock (LifecycleGate)
                     Refresh.SetActive(RunningWidgets.Values.Any(w => w.IsActive));
                 await Refresh.RequestAsync(initialCreation).ConfigureAwait(false);
@@ -298,23 +280,24 @@ sealed class QuoteWidgetProvider : IWidgetProvider
         {
             // Reload AppData stocks.json each tick so manual edits apply without reinstall.
             _config = StockConfig.Load();
-            var codes = _config.ResolveTencentCodes();
-            var quotes = await Source.Value.FetchAsync(codes).ConfigureAwait(false);
+            var quotes = await Source.FetchAsync(_config.Codes).ConfigureAwait(false);
             lock (ContentGate)
             {
-                if (quotes.Count > 0)
+                var oldQuotes = _lastQuotes.GroupBy(q => q.Key).ToDictionary(g => g.Key, g => g.First());
+                _lastQuotes = quotes.Select(q => !q.IsAvailable && oldQuotes.TryGetValue(q.Key, out var cached)
+                    ? cached with { Error = q.Error } : q).ToArray();
+                var failures = quotes.Count(q => q.Error is not null);
+                if (quotes.Any(q => q.IsAvailable))
                 {
-                    _lastQuotes = quotes;
-                    _lastError = "";
                     _lastOk = DateTimeOffset.Now;
-                    _statusLine = _lastOk.Value.ToLocalTime().ToString("HH:mm:ss");
-                    ProviderLog.Info($"fetch ok count={quotes.Count}");
                 }
-                else
+                _lastError = failures > 0 ? $"{failures} 项查询失败" : "";
+                _statusLine = quotes.Count == 0 ? "暂无关注项" : failures > 0 ? _lastError :
+                    _lastOk?.ToLocalTime().ToString("HH:mm:ss") ?? "暂无行情";
+                ProviderLog.Info($"fetch count={quotes.Count} failures={failures} codes={string.Join(',', _config.Codes)}");
+                foreach (var failed in quotes.Where(q => q.Error is not null))
                 {
-                    _lastError = "未拿到行情（检查代码或网络）";
-                    _statusLine = _lastError;
-                    ProviderLog.Error("fetch empty");
+                    ProviderLog.Error($"quote {failed.Key}: {failed.Error}");
                 }
             }
         }

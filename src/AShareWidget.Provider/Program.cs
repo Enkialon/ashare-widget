@@ -123,24 +123,12 @@ static class Program
             File.Delete(logPath);
         }
 
-        var cfg = StockConfig.Load();
-        IQuoteSource source;
         try
         {
-            source = QuoteSourceFactory.Create(cfg.Source);
-        }
-        catch (Exception ex)
-        {
-            Log("source: " + ex.Message);
-            return;
-        }
-
-        var codes = cfg.ResolveTencentCodes();
-        Log($"source: {source.Name} ({source.DisplayName})");
-        Log("codes: " + string.Join(", ", codes));
-        try
-        {
-            var quotes = await source.FetchAsync(codes);
+            var cfg = StockConfig.Load();
+            Log("codes: " + string.Join(", ", cfg.Codes));
+            IQuoteService service = new QuoteService();
+            var quotes = await service.FetchAsync(cfg.Codes);
             if (quotes.Count == 0)
             {
                 Log("no quotes returned");
@@ -149,8 +137,13 @@ static class Program
 
             foreach (var q in quotes)
             {
+                if (q.Error is not null)
+                {
+                    Log($"ERROR {q.Key}: {q.Error}");
+                    continue;
+                }
                 Log(
-                    $"{q.Name} ({q.Code})  {q.Price:0.00}  {q.Change:+0.00;-0.00;0.00}  {q.ChangePct:+0.00;-0.00;0.00}%");
+                    $"{q.Name} ({q.Key})  {q.Price:0.0000}  {q.Change:+0.00;-0.00;0.00}  {q.ChangePct:+0.00;-0.00;0.00}%  {q.QuoteTime}");
             }
 
             Log("OK -> " + logPath);
