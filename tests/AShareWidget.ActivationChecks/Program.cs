@@ -49,6 +49,8 @@ ClassObject.WaitWithComDispatch(stop);
 Console.WriteLine("PASS: signaled shutdown event exits immediately");
 await RefreshChecks.RunAsync();
 PagingChecks.Run();
+await QuoteChecks.RunAsync();
+if (args.Contains("--live")) await QuoteChecks.RunLiveAsync();
 
 static void Check(bool condition, string name)
 {

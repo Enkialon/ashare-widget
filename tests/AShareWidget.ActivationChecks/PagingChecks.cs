@@ -8,7 +8,7 @@ static class PagingChecks
     {
         var quotes = Enumerable.Range(1, 12).Select(i => new Quote
         {
-            Code = $"sh{i:000000}", Name = $"股票{i} \"名称\"", Price = 100 + i,
+            Source = "tencent", Code = $"sh{i:000000}", Name = $"股票{i} \"名称\"", Price = 100 + i,
             Change = i % 2 == 0 ? -1 : 1, ChangePct = i % 2 == 0 ? -1 : 1,
         }).ToArray();
 
